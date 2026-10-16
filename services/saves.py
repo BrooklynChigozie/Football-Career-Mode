@@ -32,14 +32,19 @@ def list_saves(app_conn: sqlite3.Connection, user_id: int) -> list[sqlite3.Row]:
 
 
 def new_game(app_conn, user_id: int, slot: int, club_id: int, club_name: str,
-             saves_dir: Path | None = None) -> sqlite3.Connection:
+             saves_dir: Path | None = None, template: Path | None = None) -> sqlite3.Connection:
     """Create a fresh save file for the slot (overwrites an existing one) and return its connection."""
     _check_slot(slot)
     saves_dir = Path(saves_dir or paths.SAVES_DIR)
     f = _file_for(user_id, slot, saves_dir)
     if f.exists():
         f.unlink()
-    game = database.init_game_db(f)
+    saves_dir.mkdir(parents=True, exist_ok=True)
+    if template is not None:
+        shutil.copyfile(template, f)
+        game = database.connect(f)
+    else:
+        game = database.init_game_db(f)
     app_conn.execute(
         """INSERT INTO saves (user_id, slot, club_id, club_name, season, file_name)
            VALUES (?, ?, ?, ?, 1, ?)
@@ -76,7 +81,17 @@ def load_game(app_conn, user_id: int, slot: int, saves_dir: Path | None = None) 
     app_conn.execute("UPDATE saves SET last_played=datetime('now') WHERE user_id=? AND slot=?",
                      (user_id, slot))
     app_conn.commit()
-    return database.connect(f)
+    conn = database.connect(f)
+    try:
+        old = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    except Exception:
+        old = None
+    if old is None or int(old[0]) < database.SCHEMA_VERSION:
+        conn.close()
+        raise SaveError(f"Slot {slot} was made with an older version of the game and can't be loaded. "
+                        "Delete it and start a new career.")
+    database.migrate(conn)
+    return conn
 
 
 def delete_save(app_conn, user_id: int, slot: int, saves_dir: Path | None = None) -> None:

@@ -95,13 +95,79 @@ CREATE INDEX IF NOT EXISTS idx_events_fixture ON match_events(fixture_id);
 CREATE INDEX IF NOT EXISTS idx_transfers_season ON transfers(season);
 CREATE INDEX IF NOT EXISTS idx_finances_club_season ON finances(club_id, season);
 CREATE INDEX IF NOT EXISTS idx_spons_club ON sponsorships(club_id);
+
+CREATE TABLE IF NOT EXISTS club_state (
+    club_id INTEGER PRIMARY KEY REFERENCES clubs(id),
+    formation TEXT NOT NULL DEFAULT '4-3-3',
+    mentality TEXT NOT NULL DEFAULT 'Balanced',
+    pressing TEXT NOT NULL DEFAULT 'Medium',
+    passing TEXT NOT NULL DEFAULT 'Mixed',
+    understanding REAL NOT NULL DEFAULT 60,
+    buy_in REAL NOT NULL DEFAULT 70,
+    xi TEXT NOT NULL DEFAULT '[]',
+    roles TEXT NOT NULL DEFAULT '{}',
+    training TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS familiarity (
+    player_id INTEGER NOT NULL REFERENCES players(id), role TEXT NOT NULL,
+    value REAL NOT NULL DEFAULT 40, PRIMARY KEY (player_id, role)
+);
+CREATE TABLE IF NOT EXISTS player_stats (
+    season INTEGER NOT NULL, player_id INTEGER NOT NULL REFERENCES players(id), club_id INTEGER,
+    apps INTEGER NOT NULL DEFAULT 0, goals INTEGER NOT NULL DEFAULT 0, assists INTEGER NOT NULL DEFAULT 0,
+    yellows INTEGER NOT NULL DEFAULT 0, reds INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (season, player_id)
+);
+CREATE TABLE IF NOT EXISTS season_history (
+    season INTEGER PRIMARY KEY, data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS news (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, season INTEGER NOT NULL, slot INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'info', text TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_stats_season_goals ON player_stats(season, goals);
+CREATE INDEX IF NOT EXISTS idx_news_season ON news(season, slot);
 """
+
+
+# Columns added after the first schema version. Applied to old saves/templates on open.
+SCHEMA_VERSION = 2
+MIGRATIONS = {
+    "players": [
+        ("pace", "INTEGER NOT NULL DEFAULT 60"), ("shooting", "INTEGER NOT NULL DEFAULT 60"),
+        ("passing", "INTEGER NOT NULL DEFAULT 60"), ("dribbling", "INTEGER NOT NULL DEFAULT 60"),
+        ("defending", "INTEGER NOT NULL DEFAULT 60"), ("physical", "INTEGER NOT NULL DEFAULT 60"),
+        ("injured_weeks", "INTEGER NOT NULL DEFAULT 0"), ("suspended_games", "INTEGER NOT NULL DEFAULT 0"),
+        ("yellow_cards", "INTEGER NOT NULL DEFAULT 0"), ("form", "REAL NOT NULL DEFAULT 6.5"),
+        ("youth", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+    "fixtures": [
+        ("stage", "TEXT NOT NULL DEFAULT ''"), ("leg", "INTEGER NOT NULL DEFAULT 1"),
+        ("tie", "INTEGER NOT NULL DEFAULT 0"), ("winner_id", "INTEGER"),
+        ("extra_time", "INTEGER NOT NULL DEFAULT 0"), ("pens_home", "INTEGER"), ("pens_away", "INTEGER"),
+        ("xg_home", "REAL"), ("xg_away", "REAL"), ("neutral", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+}
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    """Create any missing tables and add missing columns so older databases keep working after an update."""
+    conn.executescript(GAME_SCHEMA)
+    for table, cols in MIGRATIONS.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in cols:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+    conn.execute("INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(SCHEMA_VERSION),))
+    conn.commit()
 
 
 def connect(path: Path) -> sqlite3.Connection:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # check_same_thread=False: the UI runs engine calls in a worker thread, one at a time.
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -128,5 +194,5 @@ def init_app_db(path: Path | None = None) -> sqlite3.Connection:
 def init_game_db(path: Path) -> sqlite3.Connection:
     conn = connect(path)
     conn.executescript(GAME_SCHEMA)
-    conn.commit()
+    migrate(conn)
     return conn
