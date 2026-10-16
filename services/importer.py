@@ -4,10 +4,12 @@ Handles the usual mess: alternative column names, missing positions, duplicate
 players, club-name variants. Names stay in the data files so they are easy to swap.
 """
 import csv
+import random
 import re
 import sqlite3
 from pathlib import Path
 
+from engine import attributes
 from services import database
 
 TOP_LEAGUES = {
@@ -36,6 +38,8 @@ COLUMNS = {
     "club": ["club_name", "club", "team"],
     "league": ["league_name", "league"],
     "contract_until": ["club_contract_valid_until", "contract_valid_until"],
+    "pace": ["pace"], "shooting": ["shooting"], "passing": ["passing"],
+    "dribbling": ["dribbling"], "defending": ["defending"], "physical": ["physic", "physical"],
 }
 POSITION_GROUPS = {"GK": "GK", "CB": "DF", "LB": "DF", "RB": "DF", "LWB": "DF", "RWB": "DF",
                    "CDM": "MF", "CM": "MF", "CAM": "MF", "LM": "MF", "RM": "MF",
@@ -72,7 +76,7 @@ def normalise_position(raw: str, overall: int = 0) -> str:
 
 
 def import_players_csv(csv_path: Path, game_conn: sqlite3.Connection,
-                       start_season: int = 1, max_clubs_per_league: dict | None = None) -> dict:
+                       start_season: int = 1, base_year: int = 2026) -> dict:
     """Load leagues, clubs, players, contracts. Returns a summary dict (also a cleaning report)."""
     stats = {"rows": 0, "players": 0, "clubs": 0, "skipped_league": 0,
              "duplicates": 0, "bad_rows": 0, "fixed_positions": 0}
@@ -83,6 +87,7 @@ def import_players_csv(csv_path: Path, game_conn: sqlite3.Connection,
         if missing:
             raise ValueError(f"CSV is missing required columns for: {', '.join(missing)}")
 
+        rng = random.Random(2026)          # fixed seed: derived attributes are reproducible
         leagues: dict[str, int] = {}
         clubs: dict[tuple[str, str], int] = {}
         seen: set[tuple] = set()
@@ -123,18 +128,51 @@ def import_players_csv(csv_path: Path, game_conn: sqlite3.Connection,
                 value = _num(row[cols["value"]]) if cols["value"] else 0.0
                 wage = _num(row[cols["wage"]]) if cols["wage"] else 0.0
                 cid = clubs[(league, club)]
+                derived = attributes.derive(pos, overall, rng)
+                attr = {a: int(_num(row[cols[a]], derived[a])) if cols[a] else derived[a] for a in attributes.ATTRS}
                 cur = game_conn.execute(
-                    """INSERT INTO players (name, age, nationality, position, overall, potential, value, club_id)
-                       VALUES (?,?,?,?,?,?,?,?)""",
-                    (name, age, nat or None, pos, overall, potential, value, cid))
+                    """INSERT INTO players (name, age, nationality, position, overall, potential, value, club_id,
+                                            pace, shooting, passing, dribbling, defending, physical)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (name, age, nat or None, pos, overall, potential, value, cid,
+                     attr["pace"], attr["shooting"], attr["passing"], attr["dribbling"], attr["defending"],
+                     attr["physical"]))
                 until = int(_num(row[cols["contract_until"]], 0)) if cols["contract_until"] else 0
                 # Contracts are stored as a season index (1 = first season of the career).
-                expires = max(start_season, start_season + (until - 2022)) if until else start_season + 2
+                expires = max(start_season, start_season + (until - base_year)) if until else start_season + 2
                 game_conn.execute(
                     "INSERT INTO contracts (player_id, club_id, wage, expires_season) VALUES (?,?,?,?)",
                     (cur.lastrowid, cid, wage * 52, expires))   # weekly wage -> annual
                 stats["players"] += 1
             game_conn.execute(
                 "UPDATE leagues SET num_clubs = (SELECT COUNT(*) FROM clubs WHERE league_id = leagues.id)")
+            derive_club_attributes(game_conn)
+            create_competitions(game_conn)
     stats["clubs"] = len(clubs)
     return stats
+
+
+def derive_club_attributes(conn: sqlite3.Connection) -> None:
+    """Kaggle has no stadium or finance data, so derive it from squad strength."""
+    for c in conn.execute("SELECT id FROM clubs").fetchall():
+        top = [r[0] for r in conn.execute(
+            "SELECT overall FROM players WHERE club_id=? ORDER BY overall DESC LIMIT 14", (c["id"],))]
+        if not top:
+            continue
+        avg = sum(top) / len(top)
+        wages = conn.execute("SELECT COALESCE(SUM(wage),0) FROM contracts WHERE club_id=?", (c["id"],)).fetchone()[0]
+        balance = max(2_000_000.0, (avg - 58) * 5_000_000.0)
+        conn.execute(
+            """UPDATE clubs SET reputation=?, stadium_capacity=?, balance=?, transfer_budget=?, wage_budget=?
+               WHERE id=?""",
+            (round(avg), int(min(80000, max(12000, 15000 + (avg - 65) * 4500))), balance, balance * 0.5,
+             wages * 1.08, c["id"]))
+
+
+def create_competitions(conn: sqlite3.Connection) -> None:
+    """One league and one cup per league, plus the Champions League."""
+    for lg in conn.execute("SELECT id, name FROM leagues").fetchall():
+        conn.execute("INSERT INTO competitions (name, kind, league_id) VALUES (?, 'league', ?)", (lg["name"], lg["id"]))
+        conn.execute("INSERT INTO competitions (name, kind, league_id) VALUES (?, 'cup', ?)",
+                     (f"{lg['name']} Cup", lg["id"]))
+    conn.execute("INSERT INTO competitions (name, kind, league_id) VALUES ('Champions League', 'champions_league', NULL)")
